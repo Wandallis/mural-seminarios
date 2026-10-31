@@ -1,0 +1,526 @@
+name: Build, deploy e verificar
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      cloud:
+        description: Destino do deploy
+        required: true
+        type: choice
+        options:
+          - aws
+          - gcp
+          - azure
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      cloud: ${{ steps.target.outputs.cloud }}
+    steps:
+      - id: target
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_CLOUD: ${{ vars.DEPLOY_TARGET }}
+          DISPATCH_CLOUD: ${{ inputs.cloud }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            cloud="$DISPATCH_CLOUD"
+          elif [[ "$EVENT_NAME" == "push" ]]; then
+            cloud="$PUSH_CLOUD"
+          else
+            cloud=""
+          fi
+          if [[ -n "$cloud" && ! "$cloud" =~ ^(aws|gcp|azure)$ ]]; then
+            echo "::error::DEPLOY_TARGET deve ser aws, gcp ou azure."
+            exit 1
+          fi
+          echo "cloud=$cloud" >> "$GITHUB_OUTPUT"
+
+  validate:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: mural_test
+          POSTGRES_USER: mural
+          POSTGRES_PASSWORD: mural_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mural -d mural_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+      - name: Testar API com PostgreSQL
+        working-directory: backend
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgres://mural:mural_test@localhost:5432/mural_test
+        run: |
+          npm ci
+          npm test
+      - name: Compilar interface independente
+        working-directory: frontend
+        env:
+          VITE_API_URL: https://api.example.invalid
+        run: |
+          npm ci
+          npm run build
+
+  build:
+    needs: [prepare, validate]
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: type=raw,value=${{ github.sha }}
+      - name: Construir e publicar imagem somente da API
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - id: image
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ steps.metadata.outputs.tags }}
+        run: echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: [prepare, build]
+    if: github.event_name != 'pull_request' && needs.prepare.outputs.cloud != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Baixar a imagem publicada no GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Autenticar na AWS por OIDC
+        if: needs.prepare.outputs.cloud == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Publicar imagem no ECR e atualizar o App Runner
+        id: deploy-aws
+        if: needs.prepare.outputs.cloud == 'aws'
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          REGION: ${{ vars.AWS_REGION }}
+          REPOSITORY: ${{ vars.AWS_ECR_REPOSITORY }}
+          SERVICE_ARN: ${{ vars.AWS_APP_RUNNER_SERVICE_ARN }}
+          ECR_ROLE_ARN: ${{ vars.AWS_APP_RUNNER_ECR_ROLE_ARN }}
+          INSTANCE_ROLE_ARN: ${{ vars.AWS_APP_RUNNER_INSTANCE_ROLE_ARN }}
+          VPC_CONNECTOR_ARN: ${{ vars.AWS_APP_RUNNER_VPC_CONNECTOR_ARN }}
+          DATABASE_SECRET_ARN: ${{ vars.AWS_DATABASE_SECRET_ARN }}
+          API_BUCKET: ${{ vars.AWS_S3_BUCKET }}
+          FRONTEND_BUCKET: ${{ vars.AWS_FRONTEND_BUCKET }}
+          DISTRIBUTION_ID: ${{ vars.AWS_CLOUDFRONT_DISTRIBUTION_ID }}
+        run: |
+          set -euo pipefail
+          for value in "$REGION" "$REPOSITORY" "$SERVICE_ARN" "$ECR_ROLE_ARN" \
+            "$INSTANCE_ROLE_ARN" "$VPC_CONNECTOR_ARN" "$DATABASE_SECRET_ARN" \
+            "$API_BUCKET" "$FRONTEND_BUCKET" "$DISTRIBUTION_ID"; do
+            if [[ -z "$value" ]]; then
+              echo "::error::Configure as variaveis AWS do ECR, App Runner, VPC, banco e site."
+              exit 1
+            fi
+          done
+
+          distribution_domain="$(aws cloudfront get-distribution \
+            --id "$DISTRIBUTION_ID" --query 'Distribution.DomainName' --output text)"
+          frontend_url="https://$distribution_domain"
+          account_id="$(aws sts get-caller-identity --query Account --output text)"
+          registry="$account_id.dkr.ecr.$REGION.amazonaws.com"
+          if ! aws ecr describe-repositories --repository-names "$REPOSITORY" >/dev/null 2>&1; then
+            aws ecr create-repository --repository-name "$REPOSITORY" >/dev/null
+          fi
+          aws ecr get-login-password --region "$REGION" |
+            docker login --username AWS --password-stdin "$registry"
+          docker pull "$IMAGE"
+          ecr_image="$registry/$REPOSITORY:$GITHUB_SHA"
+          docker tag "$IMAGE" "$ecr_image"
+          docker push "$ecr_image"
+
+          aws apprunner describe-service --service-arn "$SERVICE_ARN" --output json > service.json
+          jq --arg image "$ecr_image" --arg ecrRole "$ECR_ROLE_ARN" \
+            --arg instanceRole "$INSTANCE_ROLE_ARN" --arg connector "$VPC_CONNECTOR_ARN" \
+            --arg databaseSecret "$DATABASE_SECRET_ARN" --arg region "$REGION" \
+            --arg bucket "$API_BUCKET" --arg origin "$frontend_url" '
+            .Service as $service |
+            ($service.SourceConfiguration.ImageRepository.ImageConfiguration.RuntimeEnvironmentVariables // {}) as $variables |
+            ($service.SourceConfiguration.ImageRepository.ImageConfiguration.RuntimeEnvironmentSecrets // {}) as $secrets |
+            {
+              ServiceArn: $service.ServiceArn,
+              SourceConfiguration: (
+                $service.SourceConfiguration |
+                .AutoDeploymentsEnabled = false |
+                .ImageRepository.ImageIdentifier = $image |
+                .ImageRepository.ImageRepositoryType = "ECR" |
+                .ImageRepository.AuthenticationConfiguration.AccessRoleArn = $ecrRole |
+                .ImageRepository.ImageConfiguration = (
+                  (.ImageRepository.ImageConfiguration // {}) + {
+                    Port: "3000",
+                    RuntimeEnvironmentVariables: ($variables + {
+                      CLOUD_PROVIDER: "aws",
+                      AWS_REGION: $region,
+                      AWS_S3_BUCKET: $bucket,
+                      DB_SSL: "true",
+                      CORS_ORIGIN: $origin
+                    }),
+                    RuntimeEnvironmentSecrets: ($secrets + {
+                      DATABASE_URL: $databaseSecret
+                    })
+                  }
+                )
+              ),
+              InstanceConfiguration: (($service.InstanceConfiguration // {}) | .InstanceRoleArn = $instanceRole),
+              NetworkConfiguration: (
+                ($service.NetworkConfiguration // {}) |
+                .EgressConfiguration = {
+                  EgressType: "VPC",
+                  VpcConnectorArn: $connector
+                }
+              ),
+              HealthCheckConfiguration: {
+                Protocol: "HTTP",
+                Path: "/health",
+                Interval: 10,
+                Timeout: 5,
+                HealthyThreshold: 1,
+                UnhealthyThreshold: 5
+              }
+            }
+          ' service.json > update-service.json
+          operation_id="$(aws apprunner update-service \
+            --cli-input-json file://update-service.json --query OperationId --output text)"
+          for attempt in $(seq 1 90); do
+            operation_status="$(aws apprunner list-operations --service-arn "$SERVICE_ARN" \
+              --output json | jq -r --arg id "$operation_id" \
+              '[.OperationSummaryList[] | select(.Id == $id) | .Status][0] // "PENDING"')"
+            if [[ "$operation_status" == "SUCCEEDED" ]]; then break; fi
+            if [[ "$operation_status" == "FAILED" ]]; then
+              echo "::error::A atualizacao do App Runner falhou."
+              exit 1
+            fi
+            sleep 10
+          done
+          if [[ "$operation_status" != "SUCCEEDED" ]]; then
+            echo "::error::Tempo esgotado aguardando a atualizacao do App Runner."
+            exit 1
+          fi
+
+          api_host="$(aws apprunner describe-service --service-arn "$SERVICE_ARN" \
+            --query 'Service.ServiceUrl' --output text)"
+          echo "api_url=https://$api_host" >> "$GITHUB_OUTPUT"
+          echo "frontend_url=$frontend_url" >> "$GITHUB_OUTPUT"
+
+      - name: Compilar e publicar site no S3 e invalidar o CloudFront
+        if: needs.prepare.outputs.cloud == 'aws'
+        env:
+          API_URL: ${{ steps.deploy-aws.outputs.api_url }}
+          BUCKET: ${{ vars.AWS_FRONTEND_BUCKET }}
+          DISTRIBUTION_ID: ${{ vars.AWS_CLOUDFRONT_DISTRIBUTION_ID }}
+        run: |
+          set -euo pipefail
+          npm ci --prefix frontend
+          VITE_API_URL="$API_URL" npm run build --prefix frontend
+          aws s3 sync frontend/dist "s3://$BUCKET" --delete
+          aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" \
+            --paths '/*' >/dev/null
+
+      - name: Autenticar no Google Cloud por Workload Identity
+        id: auth-gcp
+        if: needs.prepare.outputs.cloud == 'gcp'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        if: needs.prepare.outputs.cloud == 'gcp'
+
+      - name: Publicar imagem no Artifact Registry e atualizar Cloud Run
+        id: deploy-gcp
+        if: needs.prepare.outputs.cloud == 'gcp'
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          PROJECT: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+          REPOSITORY: ${{ vars.GCP_ARTIFACT_REPOSITORY }}
+          SERVICE: ${{ vars.GCP_RUN_SERVICE }}
+          RUNTIME_SERVICE_ACCOUNT: ${{ vars.GCP_RUNTIME_SERVICE_ACCOUNT }}
+          BUCKET: ${{ vars.GCS_BUCKET }}
+          DATABASE_SECRET: ${{ vars.GCP_DATABASE_SECRET }}
+          CLOUD_SQL_INSTANCE: ${{ vars.GCP_CLOUD_SQL_INSTANCE }}
+        run: |
+          set -euo pipefail
+          for value in "$PROJECT" "$REGION" "$REPOSITORY" "$SERVICE" "$RUNTIME_SERVICE_ACCOUNT" "$BUCKET" \
+            "$DATABASE_SECRET" "$CLOUD_SQL_INSTANCE"; do
+            if [[ -z "$value" ]]; then
+              echo "::error::Configure projeto, Artifact Registry, Cloud Run, Cloud SQL, bucket e segredo."
+              exit 1
+            fi
+          done
+          gcloud artifacts repositories describe "$REPOSITORY" \
+            --location "$REGION" --project "$PROJECT" >/dev/null 2>&1 ||
+            gcloud artifacts repositories create "$REPOSITORY" --repository-format=docker \
+              --location "$REGION" --project "$PROJECT" --quiet
+          gcloud auth configure-docker "$REGION-docker.pkg.dev" --quiet
+          destination="$REGION-docker.pkg.dev/$PROJECT/$REPOSITORY/mural-seminarios:$GITHUB_SHA"
+          docker pull "$IMAGE"
+          docker tag "$IMAGE" "$destination"
+          docker push "$destination"
+
+          frontend_url="https://$PROJECT.web.app"
+          gcloud run deploy "$SERVICE" --image "$destination" --project "$PROJECT" \
+            --region "$REGION" --platform managed --allow-unauthenticated --port 3000 \
+            --service-account "$RUNTIME_SERVICE_ACCOUNT" \
+            --add-cloudsql-instances "$CLOUD_SQL_INSTANCE" \
+            --update-env-vars "CLOUD_PROVIDER=gcp,GCS_BUCKET=$BUCKET,DB_SSL=false,CORS_ORIGIN=$frontend_url" \
+            --update-secrets "DATABASE_URL=$DATABASE_SECRET:latest" --quiet
+          api_url="$(gcloud run services describe "$SERVICE" --project "$PROJECT" \
+            --region "$REGION" --format='value(status.url)')"
+          if [[ -z "$api_url" ]]; then
+            echo "::error::Cloud Run nao retornou uma URL publica."
+            exit 1
+          fi
+          echo "api_url=$api_url" >> "$GITHUB_OUTPUT"
+          echo "frontend_url=$frontend_url" >> "$GITHUB_OUTPUT"
+
+      - name: Compilar e publicar site no Firebase Hosting
+        if: needs.prepare.outputs.cloud == 'gcp'
+        env:
+          API_URL: ${{ steps.deploy-gcp.outputs.api_url }}
+          PROJECT: ${{ vars.GCP_PROJECT_ID }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ steps.auth-gcp.outputs.credentials_file_path }}
+        run: |
+          set -euo pipefail
+          npm ci --prefix frontend
+          VITE_API_URL="$API_URL" npm run build --prefix frontend
+          npx --yes firebase-tools deploy --only hosting --project "$PROJECT" --non-interactive
+
+      - name: Autenticar no Azure por OIDC
+        if: needs.prepare.outputs.cloud == 'azure'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Obter endereco do Azure Static Web Apps
+        id: azure-site
+        if: needs.prepare.outputs.cloud == 'azure'
+        env:
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          SITE_NAME: ${{ vars.AZURE_STATIC_WEB_APP }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$RESOURCE_GROUP" || -z "$SITE_NAME" ]]; then
+            echo "::error::Configure AZURE_RESOURCE_GROUP e AZURE_STATIC_WEB_APP."
+            exit 1
+          fi
+          host="$(az staticwebapp show --resource-group "$RESOURCE_GROUP" \
+            --name "$SITE_NAME" --query defaultHostname --output tsv)"
+          if [[ -z "$host" || "$host" == "None" ]]; then
+            echo "::error::Nao foi possivel obter a URL do Azure Static Web Apps."
+            exit 1
+          fi
+          echo "frontend_url=https://$host" >> "$GITHUB_OUTPUT"
+
+      - name: Atualizar Azure Container Apps
+        id: deploy-azure
+        if: needs.prepare.outputs.cloud == 'azure'
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          APP_NAME: ${{ vars.AZURE_CONTAINER_APP }}
+          ACR_NAME: ${{ vars.AZURE_ACR_NAME }}
+          STORAGE_CONTAINER: ${{ vars.AZURE_STORAGE_CONTAINER }}
+          FRONTEND_URL: ${{ steps.azure-site.outputs.frontend_url }}
+          DATABASE_URL: ${{ secrets.AZURE_DATABASE_URL }}
+          STORAGE_CONNECTION_STRING: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
+        run: |
+          set -euo pipefail
+          for value in "$RESOURCE_GROUP" "$APP_NAME" "$ACR_NAME" "$STORAGE_CONTAINER" "$FRONTEND_URL" \
+            "$DATABASE_URL" "$STORAGE_CONNECTION_STRING"; do
+            if [[ -z "$value" ]]; then
+              echo "::error::Configure Container Apps, Static Web Apps, storage e segredos do Azure."
+              exit 1
+            fi
+          done
+          az acr login --name "$ACR_NAME"
+          acr_host="$(az acr show --name "$ACR_NAME" --query loginServer --output tsv)"
+          docker pull "$IMAGE"
+          container_image="$acr_host/mural-seminarios:$GITHUB_SHA"
+          docker tag "$IMAGE" "$container_image"
+          docker push "$container_image"
+          az containerapp secret set --resource-group "$RESOURCE_GROUP" --name "$APP_NAME" \
+            --secrets "database-url=$DATABASE_URL" \
+            "storage-connection-string=$STORAGE_CONNECTION_STRING" >/dev/null
+          az containerapp update --resource-group "$RESOURCE_GROUP" --name "$APP_NAME" \
+            --image "$container_image" \
+            --set-env-vars "CLOUD_PROVIDER=azure" "CORS_ORIGIN=$FRONTEND_URL" \
+            "AZURE_STORAGE_CONTAINER=$STORAGE_CONTAINER" "DB_SSL=true" \
+            "DATABASE_URL=secretref:database-url" \
+            "AZURE_STORAGE_CONNECTION_STRING=secretref:storage-connection-string" >/dev/null
+          host="$(az containerapp show --resource-group "$RESOURCE_GROUP" --name "$APP_NAME" \
+            --query properties.configuration.ingress.fqdn --output tsv)"
+          if [[ -z "$host" || "$host" == "None" ]]; then
+            echo "::error::Habilite o ingress publico do Azure Container App."
+            exit 1
+          fi
+          echo "api_url=https://$host" >> "$GITHUB_OUTPUT"
+
+      - name: Compilar e publicar site no Azure Static Web Apps
+        if: needs.prepare.outputs.cloud == 'azure'
+        env:
+          API_URL: ${{ steps.deploy-azure.outputs.api_url }}
+          DEPLOYMENT_TOKEN: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$DEPLOYMENT_TOKEN" ]]; then
+            echo "::error::Configure o segredo AZURE_STATIC_WEB_APPS_API_TOKEN."
+            exit 1
+          fi
+          npm ci --prefix frontend
+          VITE_API_URL="$API_URL" npm run build --prefix frontend
+
+      - name: Publicar artefato compilado no Azure Static Web Apps
+        if: needs.prepare.outputs.cloud == 'azure'
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+          action: upload
+          app_location: frontend
+          output_location: dist
+          skip_app_build: true
+
+      - name: Verificar site estatico, API e PostgreSQL
+        env:
+          CLOUD: ${{ needs.prepare.outputs.cloud }}
+          AWS_API_URL: ${{ steps.deploy-aws.outputs.api_url }}
+          AWS_FRONTEND_URL: ${{ steps.deploy-aws.outputs.frontend_url }}
+          GCP_API_URL: ${{ steps.deploy-gcp.outputs.api_url }}
+          GCP_FRONTEND_URL: ${{ steps.deploy-gcp.outputs.frontend_url }}
+          AZURE_API_URL: ${{ steps.deploy-azure.outputs.api_url }}
+          AZURE_FRONTEND_URL: ${{ steps.azure-site.outputs.frontend_url }}
+          IMAGE: ${{ needs.build.outputs.image }}
+        run: |
+          set -euo pipefail
+          case "$CLOUD" in
+            aws) api_url="$AWS_API_URL"; frontend_url="$AWS_FRONTEND_URL" ;;
+            gcp) api_url="$GCP_API_URL"; frontend_url="$GCP_FRONTEND_URL" ;;
+            azure) api_url="$AZURE_API_URL"; frontend_url="$AZURE_FRONTEND_URL" ;;
+          esac
+          if [[ -z "$api_url" || -z "$frontend_url" ]]; then
+            echo "::error::O deploy nao retornou as URLs publicas da API e do site."
+            exit 1
+          fi
+          curl --fail --silent --show-error --retry 12 --retry-connrefused \
+            --retry-delay 10 --max-time 20 "$frontend_url/" >/dev/null
+          health="$(curl --fail --silent --show-error --retry 12 --retry-connrefused \
+            --retry-delay 10 --max-time 20 "$api_url/health")"
+          echo "$health" | jq -e '.status == "UP" and .database == "UP"' >/dev/null
+          headers="$(mktemp)"
+          trap 'rm -f "$headers"' EXIT
+          curl --fail --silent --show-error -D "$headers" -o /dev/null \
+            -H "Origin: $frontend_url" "$api_url/health"
+          if ! grep -Fiq "access-control-allow-origin: $frontend_url" "$headers"; then
+            echo "::error::A API nao autorizou via CORS a origem do site publicado."
+            exit 1
+          fi
+          {
+            echo "## Deploy verificado"
+            echo ""
+            echo "- Destino: **$CLOUD**"
+            echo "- Site: $frontend_url"
+            echo "- API: $api_url"
+            echo "- Health check: API, PostgreSQL e CORS responderam **UP**."
+            echo "- Imagem: \`$IMAGE\`"
+            echo "- Logs: veja a aba **Actions** e os logs do provedor."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Site e API publicados e verificados."
+
+      - name: Consultar logs do AWS App Runner em caso de falha
+        if: failure() && needs.prepare.outputs.cloud == 'aws'
+        env:
+          LOG_GROUP: ${{ vars.AWS_LOG_GROUP }}
+        run: |
+          if [[ -n "$LOG_GROUP" ]]; then
+            aws logs tail "$LOG_GROUP" --since 10m ||
+              echo "::warning::Falha ao consultar logs do CloudWatch."
+          else
+            echo "::warning::Configure AWS_LOG_GROUP para consultar logs no CloudWatch."
+          fi
+
+      - name: Consultar logs do Google Cloud Run em caso de falha
+        if: failure() && needs.prepare.outputs.cloud == 'gcp'
+        env:
+          PROJECT: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+          SERVICE: ${{ vars.GCP_RUN_SERVICE }}
+        run: |
+          if [[ -n "$PROJECT" && -n "$REGION" && -n "$SERVICE" ]]; then
+            gcloud run services logs read "$SERVICE" --project "$PROJECT" \
+              --region "$REGION" --limit 40 ||
+              echo "::warning::Falha ao consultar logs do Cloud Run."
+          fi
+
+      - name: Consultar logs do Azure Container Apps em caso de falha
+        if: failure() && needs.prepare.outputs.cloud == 'azure'
+        env:
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          APP_NAME: ${{ vars.AZURE_CONTAINER_APP }}
+        run: |
+          if [[ -n "$RESOURCE_GROUP" && -n "$APP_NAME" ]]; then
+            az containerapp logs show --resource-group "$RESOURCE_GROUP" \
+              --name "$APP_NAME" --tail 40 ||
+              echo "::warning::Falha ao consultar logs do Azure Container Apps."
+          fi

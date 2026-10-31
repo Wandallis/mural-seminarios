@@ -1,0 +1,153 @@
+# Mural de Seminarios
+
+Aplicacao web para cadastrar seminarios, anexar slides em PDF e registrar a presenca de cada apresentador. O mesmo codigo pode ser implantado em AWS, Google Cloud ou Azure; mudam os recursos e as credenciais de cada destino.
+
+## Arquitetura
+
+| Parte | Tecnologia | Localmente | Na nuvem |
+| --- | --- | --- | --- |
+| Site | React + Vite, arquivos estaticos | Container Nginx em `http://localhost:5173` | AWS S3 + CloudFront, Firebase Hosting ou Azure Static Web Apps |
+| API | Node.js + Express, imagem Docker | Container em `http://localhost:3000` | AWS App Runner, Google Cloud Run ou Azure Container Apps |
+| Banco | PostgreSQL | Container com volume persistente | RDS, Cloud SQL ou Azure Database for PostgreSQL |
+| Slides | Storage de objetos privado | Volume Docker | S3, Google Cloud Storage ou Azure Blob Storage |
+
+O site e a API sao servicos separados. `VITE_API_URL` e definido no momento em que o React e compilado; o deploy tambem configura `CORS_ORIGIN` na API para aceitar o dominio do site. A imagem Docker contem somente a API.
+
+## Executar localmente
+
+Na pasta `mural-seminarios`, execute:
+
+```sh
+docker compose up --build
+```
+
+Abra `http://localhost:5173`. O Compose inicia PostgreSQL, API e site em containers separados. A API fica em `http://localhost:3000`; o PostgreSQL e os slides continuam em volumes Docker.
+
+Para encerrar, use `Ctrl+C` e depois `docker compose down`. Isso preserva os volumes. **Nao use `docker compose down -v`** se quiser manter os dados locais.
+
+Para rodar sem Docker, inicie PostgreSQL, configure `backend/.env` a partir de `backend/.env.example`, instale as dependencias e inicie a API:
+
+```sh
+cd backend
+npm ci
+npm run dev
+```
+
+Em outro terminal, inicie o site:
+
+```sh
+cd frontend
+npm ci
+npm run dev
+```
+
+Abra `http://localhost:5173`. `frontend/.env.example` mostra a configuracao local de `VITE_API_URL`.
+
+## Funcionalidades e API
+
+- `GET /health`: confirma que API e PostgreSQL estao disponiveis.
+- `GET /api/seminars`: lista seminarios e apresentadores.
+- `POST /api/seminars`: cadastra seminario com 1 a 10 apresentadores e, opcionalmente, um PDF no campo multipart `slides`.
+- `GET /api/seminars/:id/slides`: baixa o PDF do seminario.
+- `GET /api/seminars/:id/presenters`: lista os apresentadores e a situacao de presenca.
+- `PATCH /api/seminars/:id/presenters/:presenterId`: marca o apresentador como presente ou ausente.
+- `DELETE /api/seminars/:id`: apaga o seminario e remove os slides do armazenamento.
+
+Os PDFs sao validados por tipo e assinatura e tem limite padrao de 10 MB (`MAX_UPLOAD_SIZE_BYTES`). A API cria/atualiza as tabelas necessarias ao iniciar.
+
+**Nao ha login, conforme solicitado para o trabalho academico.** Isso significa que qualquer pessoa que consiga acessar a URL publica pode cadastrar e excluir seminarios, baixar slides e alterar presencas. Nao use com dados pessoais ou para uma turma que precise de controle de acesso.
+
+## Pipeline: do commit a verificacao
+
+O workflow [.github/workflows/deploy.yml](./.github/workflows/deploy.yml) executa:
+
+1. **Commit/push:** um push para `main` inicia o pipeline; pull requests executam validacao e build, sem publicar nem implantar.
+2. **Build e testes:** testa a API com PostgreSQL, compila o site e cria uma imagem Docker contendo somente a API.
+3. **Publicacao e deploy:** publica a imagem no GitHub Container Registry e a copia para o registry nativo escolhido. Atualiza a API e publica o site estatico separadamente.
+4. **Verificacao:** testa a pagina publica, `/health` da API, a conexao com PostgreSQL e o cabecalho CORS. O resumo da execucao mostra as URLs; falhas incluem consulta aos logs do servico quando configurada.
+
+O destino em pushes para `main` e escolhido pela variavel GitHub `DEPLOY_TARGET` (`aws`, `gcp` ou `azure`). Tambem e possivel escolher um destino em **Actions > Build, deploy e verificar > Run workflow**. O workflow implanta um destino por execucao; ele nao cria bancos, redes privadas, buckets, distribuicoes CDN ou servicos web.
+
+### Criar o repositorio GitHub
+
+Crie um repositorio vazio no GitHub e, na pasta do projeto, associe e envie o codigo:
+
+```sh
+git init -b main
+git add .
+git commit -m "feat: preparar deploy multi-cloud"
+git remote add origin https://github.com/<usuario>/<repositorio>.git
+git push -u origin main
+```
+
+Substitua a URL pelo repositorio real. Em **Settings > Actions > General > Workflow permissions**, permita que o `GITHUB_TOKEN` leia e publique packages. Cadastre valores em **Settings > Secrets and variables > Actions**. Use **Variables** para configuracoes nao sigilosas e **Secrets** para credenciais e strings de conexao. Nunca grave esses valores no codigo.
+
+Depois que os recursos de uma nuvem estiverem prontos, defina `DEPLOY_TARGET` e os valores listados abaixo. A imagem GHCR pode permanecer privada: o workflow autentica para baixa-la e publica uma copia no registry nativo.
+
+### AWS
+
+| Servico | Recurso |
+| --- | --- |
+| API | App Runner, imagem no ECR |
+| Site | Bucket S3 privado atras de uma distribuicao CloudFront |
+| Banco | RDS PostgreSQL |
+| Slides | Bucket S3 |
+
+**Importante:** a AWS informou que o App Runner nao esta aceitando novos clientes. O pipeline atende contas que ja tenham acesso ao App Runner; se a sua conta nao puder criar/usar esse servico, sera necessario escolher outro destino AWS antes de implantar.
+
+Crie previamente o servico App Runner, ECR (o workflow pode criar o repositorio), bucket de slides, bucket privado do site e distribuicao CloudFront com acesso ao bucket do site. Configure o App Runner com ingress publico e um conector VPC de saida que alcance o RDS. O security group do banco precisa permitir PostgreSQL a partir dessa rede; para acessar S3 com esse conector, configure NAT Gateway ou endpoint VPC para S3. A role de instancia do App Runner precisa ler o segredo do banco e ler/gravar slides no S3. O CloudFront deve apontar para o bucket privado com Origin Access Control e servir `index.html` como documento raiz.
+
+**Variables:** `DEPLOY_TARGET=aws`, `AWS_REGION`, `AWS_ECR_REPOSITORY`, `AWS_APP_RUNNER_SERVICE_ARN`, `AWS_APP_RUNNER_ECR_ROLE_ARN`, `AWS_APP_RUNNER_INSTANCE_ROLE_ARN`, `AWS_APP_RUNNER_VPC_CONNECTOR_ARN`, `AWS_DATABASE_SECRET_ARN`, `AWS_S3_BUCKET`, `AWS_FRONTEND_BUCKET`, `AWS_CLOUDFRONT_DISTRIBUTION_ID`. `AWS_LOG_GROUP` e opcional para consulta de logs.
+
+**Secrets:** `AWS_ROLE_TO_ASSUME`, role de deploy confiavel ao OIDC do GitHub. O segredo identificado por `AWS_DATABASE_SECRET_ARN` deve conter a string `DATABASE_URL` do RDS.
+
+### Google Cloud
+
+| Servico | Recurso |
+| --- | --- |
+| API | Cloud Run, imagem no Artifact Registry |
+| Site | Firebase Hosting |
+| Banco | Cloud SQL PostgreSQL |
+| Slides | Google Cloud Storage |
+
+Crie o projeto Firebase/Google Cloud, Cloud Run, Cloud SQL, bucket e service account de runtime. Atribua ao service account permissoes de acesso ao Cloud SQL, ao segredo no Secret Manager e ao bucket. O Cloud SQL deve estar conectado ao Cloud Run; o workflow configura `--add-cloudsql-instances`.
+
+O segredo `GCP_DATABASE_SECRET` deve conter uma URL PostgreSQL que use o socket Cloud SQL, por exemplo `postgresql://USUARIO:SENHA@/BANCO?host=/cloudsql/PROJETO:REGIAO:INSTANCIA`. Codifique caracteres especiais de usuario/senha na URL. O trafego entre Cloud Run e Cloud SQL passa pelo conector gerenciado; o workflow desativa SSL do cliente PostgreSQL para essa conexao por socket.
+
+**Variables:** `DEPLOY_TARGET=gcp`, `GCP_PROJECT_ID`, `GCP_REGION`, `GCP_ARTIFACT_REPOSITORY`, `GCP_RUN_SERVICE`, `GCP_RUNTIME_SERVICE_ACCOUNT`, `GCP_CLOUD_SQL_INSTANCE` (formato `projeto:regiao:instancia`), `GCS_BUCKET` e `GCP_DATABASE_SECRET` (nome do segredo no Secret Manager).
+
+**Secrets:** `GCP_WORKLOAD_IDENTITY_PROVIDER` e `GCP_SERVICE_ACCOUNT`. Configure Workload Identity Federation para o repositorio GitHub. A identidade de deploy precisa administrar Artifact Registry e Cloud Run; a identidade de runtime precisa acessar Cloud SQL, Secret Manager e GCS. Habilite Firebase Hosting e conceda a permissao de deploy ao service account usado pelo workflow.
+
+### Azure
+
+| Servico | Recurso |
+| --- | --- |
+| API | Azure Container Apps, imagem no Azure Container Registry |
+| Site | Azure Static Web Apps |
+| Banco | Azure Database for PostgreSQL |
+| Slides | Azure Blob Storage |
+
+Crie previamente Container Apps com ingress publico na porta 3000, um Azure Container Registry, Static Web Apps, conta/container Blob Storage e PostgreSQL. A identidade de runtime do Container App precisa poder baixar do ACR; a rede/firewall do PostgreSQL deve aceitar conexoes do Container App. O workflow grava a URL do banco e a connection string do Blob como segredos do Container App.
+
+**Variables:** `DEPLOY_TARGET=azure`, `AZURE_RESOURCE_GROUP`, `AZURE_CONTAINER_APP`, `AZURE_ACR_NAME`, `AZURE_STATIC_WEB_APP` e `AZURE_STORAGE_CONTAINER`.
+
+**Secrets:** `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_STATIC_WEB_APPS_API_TOKEN`, `AZURE_DATABASE_URL` e `AZURE_STORAGE_CONNECTION_STRING`. A identidade federada do GitHub precisa atualizar Container Apps, publicar no ACR e consultar os recursos; o token do Static Web Apps autoriza a publicacao do site.
+
+## Variaveis da aplicacao
+
+- `DATABASE_URL`: conexao PostgreSQL.
+- `DB_SSL=true`: habilita TLS para conexoes TCP em nuvem; `DB_SSL=false` no Compose local e no socket Cloud SQL.
+- `CORS_ORIGIN`: origem exata do site publicado. Pode aceitar varias origens separadas por virgula.
+- `CLOUD_PROVIDER`: `local`, `aws`, `gcp` ou `azure`.
+- `AWS_REGION` e `AWS_S3_BUCKET`, `GCS_BUCKET` ou `AZURE_STORAGE_CONTAINER`: configuracao do storage escolhido.
+- `LOCAL_STORAGE_DIR`: diretorio local de slides no desenvolvimento.
+
+## Construir a imagem da API
+
+Na raiz do projeto:
+
+```sh
+docker build -t mural-seminarios-api .
+```
+
+A imagem expoe a porta 3000. Para uso local completo, prefira Docker Compose, que tambem configura o banco, o site e os volumes.
