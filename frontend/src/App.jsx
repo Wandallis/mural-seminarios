@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 
 const apiUrl = (import.meta.env.VITE_API_URL ||
   (import.meta.env.DEV ? 'http://localhost:3000' : window.location.origin)).replace(/\/$/, '');
+const directSlideUpload = import.meta.env.VITE_DIRECT_SLIDE_UPLOAD === 'true';
 
 async function responseData(response) {
   const data = await response.json();
@@ -76,18 +77,48 @@ function App() {
     const form = event.currentTarget;
     const formData = new FormData(form);
     formData.delete('presenters');
-    presenters.map((presenter) => presenter.trim()).filter(Boolean)
-      .forEach((presenter) => formData.append('presenters', presenter));
+    const seminarPresenters = presenters.map((presenter) => presenter.trim()).filter(Boolean);
+    seminarPresenters.forEach((presenter) => formData.append('presenters', presenter));
     const dateTime = formData.get('startsAt');
     if (dateTime) {
       formData.set('startsAt', new Date(dateTime).toISOString());
     }
 
     try {
-      await responseData(await fetch(`${apiUrl}/api/seminars`, {
-        method: 'POST',
-        body: formData
-      }));
+      if (directSlideUpload && formData.get('slides') instanceof File &&
+          formData.get('slides').size > 0) {
+        const slides = formData.get('slides');
+        const upload = await responseData(await fetch(`${apiUrl}/api/slides/uploads`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contentType: slides.type, size: slides.size })
+        }));
+        const uploadForm = new FormData();
+        Object.entries(upload.fields).forEach(([name, value]) => uploadForm.append(name, value));
+        uploadForm.append('file', slides);
+        const uploadResponse = await fetch(upload.url, { method: 'POST', body: uploadForm });
+        if (!uploadResponse.ok) {
+          throw new Error('Nao foi possivel enviar os slides ao armazenamento.');
+        }
+
+        const seminar = Object.fromEntries(formData.entries());
+        delete seminar.slides;
+        seminar.presenters = seminarPresenters;
+        seminar.slidesKey = upload.key;
+        if (dateTime) {
+          seminar.startsAt = new Date(dateTime).toISOString();
+        }
+        await responseData(await fetch(`${apiUrl}/api/seminars`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(seminar)
+        }));
+      } else {
+        await responseData(await fetch(`${apiUrl}/api/seminars`, {
+          method: 'POST',
+          body: formData
+        }));
+      }
       form.reset();
       setPresenters(['']);
       setFormMessage('Seminario cadastrado com sucesso.');

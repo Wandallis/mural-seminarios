@@ -7,7 +7,7 @@ Aplicacao web para cadastrar seminarios, anexar slides em PDF e registrar a pres
 | Parte | Tecnologia | Localmente | Na nuvem |
 | --- | --- | --- | --- |
 | Site | React + Vite, arquivos estaticos | Container Nginx em `http://localhost:5173` | AWS S3 + CloudFront, Firebase Hosting ou Azure Static Web Apps |
-| API | Node.js + Express, imagem Docker | Container em `http://localhost:3000` | AWS App Runner, Google Cloud Run ou Azure Container Apps |
+| API | Node.js + Express, imagem Docker | Container em `http://localhost:3000` | AWS Lambda + API Gateway, Google Cloud Run ou Azure Container Apps |
 | Banco | PostgreSQL | Container com volume persistente | RDS, Cloud SQL ou Azure Database for PostgreSQL |
 | Slides | Storage de objetos privado | Volume Docker | S3, Google Cloud Storage ou Azure Blob Storage |
 
@@ -47,6 +47,7 @@ Abra `http://localhost:5173`. `frontend/.env.example` mostra a configuracao loca
 
 - `GET /health`: confirma que API e PostgreSQL estao disponiveis.
 - `GET /api/seminars`: lista seminarios e apresentadores.
+- `POST /api/slides/uploads`: no destino AWS, cria um formulario de upload temporario para enviar PDF diretamente ao S3.
 - `POST /api/seminars`: cadastra seminario com 1 a 10 apresentadores e, opcionalmente, um PDF no campo multipart `slides`.
 - `GET /api/seminars/:id/slides`: baixa o PDF do seminario.
 - `GET /api/seminars/:id/presenters`: lista os apresentadores e a situacao de presenca.
@@ -88,18 +89,24 @@ Depois que os recursos de uma nuvem estiverem prontos, defina `DEPLOY_TARGET` e 
 
 | Servico | Recurso |
 | --- | --- |
-| API | App Runner, imagem no ECR |
+| API | Lambda (container no ECR) + API Gateway HTTP API |
 | Site | Bucket S3 privado atras de uma distribuicao CloudFront |
 | Banco | RDS PostgreSQL |
 | Slides | Bucket S3 |
 
-**Importante:** a AWS informou que o App Runner nao esta aceitando novos clientes. O pipeline atende contas que ja tenham acesso ao App Runner; se a sua conta nao puder criar/usar esse servico, sera necessario escolher outro destino AWS antes de implantar.
+Lambda usa o AWS Lambda Web Adapter para executar o servidor Express. A API fica atras de um HTTP API do API Gateway. Os slides sao enviados diretamente do navegador ao S3 por um formulario presigned de curta duracao; a API valida o objeto, registra-o no PostgreSQL e usa links presigned curtos para download. Assim, os PDFs nao precisam atravessar os limites de payload de Lambda/API Gateway.
 
-Crie previamente o servico App Runner, ECR (o workflow pode criar o repositorio), bucket de slides, bucket privado do site e distribuicao CloudFront com acesso ao bucket do site. Configure o App Runner com ingress publico e um conector VPC de saida que alcance o RDS. O security group do banco precisa permitir PostgreSQL a partir dessa rede; para acessar S3 com esse conector, configure NAT Gateway ou endpoint VPC para S3. A role de instancia do App Runner precisa ler o segredo do banco e ler/gravar slides no S3. O CloudFront deve apontar para o bucket privado com Origin Access Control e servir `index.html` como documento raiz.
+**Custo:** novas contas AWS podem ter um plano Free com creditos promocionais, mas isso nao torna toda a arquitetura gratuita nem garante que cada recurso/uso seja coberto. RDS, ECR, S3, API Gateway, CloudWatch e transferencia podem consumir creditos ou ser cobrados conforme o tipo de conta/regiao. Confira o [AWS Free Tier](https://aws.amazon.com/free/) da sua conta e configure um budget/alerta antes de criar recursos. Orcamento alerta, nao bloqueia gasto. Nao converta a conta para plano pago sem revisar os precos e limites.
 
-**Variables:** `DEPLOY_TARGET=aws`, `AWS_REGION`, `AWS_ECR_REPOSITORY`, `AWS_APP_RUNNER_SERVICE_ARN`, `AWS_APP_RUNNER_ECR_ROLE_ARN`, `AWS_APP_RUNNER_INSTANCE_ROLE_ARN`, `AWS_APP_RUNNER_VPC_CONNECTOR_ARN`, `AWS_DATABASE_SECRET_ARN`, `AWS_S3_BUCKET`, `AWS_FRONTEND_BUCKET`, `AWS_CLOUDFRONT_DISTRIBUTION_ID`. `AWS_LOG_GROUP` e opcional para consulta de logs.
+Crie previamente: (1) VPC/subnets privadas, security group e RDS PostgreSQL; (2) endpoint Gateway para S3 associado as route tables usadas pela Lambda, para nao depender de NAT Gateway; (3) role de execucao Lambda; (4) bucket privado de slides com CORS permitindo `POST` apenas da origem CloudFront, e regra de lifecycle para apagar `pending/` apos 1 dia; (5) bucket privado do site e distribuicao CloudFront com Origin Access Control e `index.html` como documento raiz. Mantenha o RDS privado: a regra de entrada TCP 5432 deve permitir somente o security group da Lambda. O security group da Lambda precisa permitir conexoes de saida ao RDS e ao S3 pelo endpoint. Use nomes de bucket/registry dedicados ao projeto: o workflow configura a politica de retencao de imagens do ECR e sincroniza o bucket do site com `--delete`.
 
-**Secrets:** `AWS_ROLE_TO_ASSUME`, role de deploy confiavel ao OIDC do GitHub. O segredo identificado por `AWS_DATABASE_SECRET_ARN` deve conter a string `DATABASE_URL` do RDS.
+**Variables do repositorio GitHub:** `DEPLOY_TARGET=aws`, `AWS_REGION`, `AWS_ECR_REPOSITORY`, `AWS_LAMBDA_FUNCTION`, `AWS_LAMBDA_EXECUTION_ROLE_ARN`, `AWS_API_GATEWAY_NAME`, `AWS_LAMBDA_SUBNET_IDS` (IDs separados por virgula), `AWS_LAMBDA_SECURITY_GROUP_ID`, `AWS_S3_BUCKET`, `AWS_FRONTEND_BUCKET` e `AWS_CLOUDFRONT_DISTRIBUTION_ID`.
+
+**Secrets:** `AWS_ROLE_TO_ASSUME` (role de deploy confiavel ao OIDC do GitHub) e `AWS_DATABASE_URL` (string PostgreSQL do RDS; codifique caracteres especiais do usuario/senha na URL). O workflow grava a string como variavel protegida na configuracao da Lambda; nao a imprima nem a coloque no codigo. A role de execucao da Lambda precisa de `AWSLambdaBasicExecutionRole`, `AWSLambdaVPCAccessExecutionRole` e permissao de leitura/escrita/exclusao somente nos objetos do bucket de slides. A role OIDC do GitHub precisa publicar imagens no ECR e configurar a retencao, criar/atualizar a funcao Lambda e sua concorrencia, passar a role de execucao, criar/atualizar API Gateway e permissao de invocacao, configurar/limitar logs, configurar CORS do bucket, publicar o site e invalidar o CloudFront.
+
+O workflow limita a Lambda a 512 MB, 30 segundos e duas execucoes simultaneas, e limita o HTTP API a 2 requisicoes por segundo com burst 5. Esses limites reduzem risco de abuso, mas nao garantem custo zero. O Lambda precisa estar na VPC do RDS; sem endpoint Gateway para S3, nao coloque NAT Gateway apenas para este projeto, pois NAT pode gerar custo fixo relevante.
+
+O navegador envia PDFs diretamente ao S3. No bucket de slides, configure CORS com a origem exata `https://<dominio-cloudfront>`, metodo `POST` e headers permitidos `*`. O bucket do site deve ser dedicado a este projeto porque o workflow sincroniza arquivos com `--delete`.
 
 ### Google Cloud
 

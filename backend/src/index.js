@@ -92,6 +92,26 @@ app.get('/api/seminars', async (_request, response, next) => {
   }
 });
 
+app.post('/api/slides/uploads', async (request, response, next) => {
+  if (typeof storage.createUploadUrl !== 'function') {
+    response.status(404).json({ error: 'Upload direto para storage nao esta habilitado.' });
+    return;
+  }
+  if (request.body?.contentType !== 'application/pdf' ||
+      !Number.isSafeInteger(request.body?.size) ||
+      request.body.size < 1 ||
+      request.body.size > maxUploadSize) {
+    response.status(400).json({ error: 'Envie um PDF valido dentro do limite de tamanho.' });
+    return;
+  }
+
+  try {
+    response.json(await storage.createUploadUrl(maxUploadSize));
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get('/api/seminars/:id/presenters', async (request, response, next) => {
   if (!/^\d+$/.test(request.params.id)) {
     response.status(400).json({ error: 'Identificador de seminario invalido.' });
@@ -184,11 +204,24 @@ app.post('/api/seminars', upload.single('slides'), async (request, response, nex
     return;
   }
 
-  let slidesKey;
+  const uploadedKey = body.slidesKey;
+  if (uploadedKey !== undefined &&
+      (typeof uploadedKey !== 'string' ||
+       !/^pending\/[0-9a-f-]{36}\.pdf$/i.test(uploadedKey) ||
+       typeof storage.validateUploadedFile !== 'function' ||
+       typeof storage.finalizeUpload !== 'function')) {
+    response.status(400).json({ error: 'Referencia de upload de slides invalida.' });
+    return;
+  }
+
+  let slidesKey = uploadedKey;
   let client;
   try {
     if (request.file) {
       slidesKey = await storage.uploadFile(request.file.buffer);
+    } else if (uploadedKey) {
+      await storage.validateUploadedFile(uploadedKey, maxUploadSize);
+      slidesKey = await storage.finalizeUpload(uploadedKey);
     }
 
     client = await pool.connect();
@@ -253,6 +286,11 @@ app.get('/api/seminars/:id/slides', async (request, response, next) => {
     }
     if (!result.rows[0].slides_key) {
       response.status(404).json({ error: 'Este seminario ainda nao possui slides.' });
+      return;
+    }
+
+    if (typeof storage.createDownloadUrl === 'function') {
+      response.redirect(302, await storage.createDownloadUrl(result.rows[0].slides_key));
       return;
     }
 

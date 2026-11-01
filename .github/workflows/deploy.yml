@@ -147,28 +147,29 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Publicar imagem no ECR e atualizar o App Runner
+      - name: Publicar imagem, atualizar Lambda e configurar API Gateway
         id: deploy-aws
         if: needs.prepare.outputs.cloud == 'aws'
         env:
           IMAGE: ${{ needs.build.outputs.image }}
           REGION: ${{ vars.AWS_REGION }}
           REPOSITORY: ${{ vars.AWS_ECR_REPOSITORY }}
-          SERVICE_ARN: ${{ vars.AWS_APP_RUNNER_SERVICE_ARN }}
-          ECR_ROLE_ARN: ${{ vars.AWS_APP_RUNNER_ECR_ROLE_ARN }}
-          INSTANCE_ROLE_ARN: ${{ vars.AWS_APP_RUNNER_INSTANCE_ROLE_ARN }}
-          VPC_CONNECTOR_ARN: ${{ vars.AWS_APP_RUNNER_VPC_CONNECTOR_ARN }}
-          DATABASE_SECRET_ARN: ${{ vars.AWS_DATABASE_SECRET_ARN }}
+          FUNCTION_NAME: ${{ vars.AWS_LAMBDA_FUNCTION }}
+          FUNCTION_ROLE_ARN: ${{ vars.AWS_LAMBDA_EXECUTION_ROLE_ARN }}
+          API_NAME: ${{ vars.AWS_API_GATEWAY_NAME }}
+          SUBNET_IDS: ${{ vars.AWS_LAMBDA_SUBNET_IDS }}
+          SECURITY_GROUP_ID: ${{ vars.AWS_LAMBDA_SECURITY_GROUP_ID }}
+          DATABASE_URL: ${{ secrets.AWS_DATABASE_URL }}
           API_BUCKET: ${{ vars.AWS_S3_BUCKET }}
           FRONTEND_BUCKET: ${{ vars.AWS_FRONTEND_BUCKET }}
           DISTRIBUTION_ID: ${{ vars.AWS_CLOUDFRONT_DISTRIBUTION_ID }}
         run: |
           set -euo pipefail
-          for value in "$REGION" "$REPOSITORY" "$SERVICE_ARN" "$ECR_ROLE_ARN" \
-            "$INSTANCE_ROLE_ARN" "$VPC_CONNECTOR_ARN" "$DATABASE_SECRET_ARN" \
+          for value in "$REGION" "$REPOSITORY" "$FUNCTION_NAME" "$FUNCTION_ROLE_ARN" \
+            "$API_NAME" "$SUBNET_IDS" "$SECURITY_GROUP_ID" "$DATABASE_URL" \
             "$API_BUCKET" "$FRONTEND_BUCKET" "$DISTRIBUTION_ID"; do
             if [[ -z "$value" ]]; then
-              echo "::error::Configure as variaveis AWS do ECR, App Runner, VPC, banco e site."
+              echo "::error::Configure as variaveis AWS de Lambda, API Gateway, VPC, banco e buckets."
               exit 1
             fi
           done
@@ -181,6 +182,20 @@ jobs:
           if ! aws ecr describe-repositories --repository-names "$REPOSITORY" >/dev/null 2>&1; then
             aws ecr create-repository --repository-name "$REPOSITORY" >/dev/null
           fi
+          lifecycle_policy="$(jq -cn '{
+            rules: [{
+              rulePriority: 1,
+              description: "Keep only the five newest deployment images",
+              selection: {
+                tagStatus: "tagged",
+                countType: "imageCountMoreThan",
+                countNumber: 5
+              },
+              action: {type: "expire"}
+            }]
+          }')"
+          aws ecr put-lifecycle-policy --repository-name "$REPOSITORY" \
+            --lifecycle-policy-text "$lifecycle_policy" >/dev/null
           aws ecr get-login-password --region "$REGION" |
             docker login --username AWS --password-stdin "$registry"
           docker pull "$IMAGE"
@@ -188,80 +203,144 @@ jobs:
           docker tag "$IMAGE" "$ecr_image"
           docker push "$ecr_image"
 
-          aws apprunner describe-service --service-arn "$SERVICE_ARN" --output json > service.json
-          jq --arg image "$ecr_image" --arg ecrRole "$ECR_ROLE_ARN" \
-            --arg instanceRole "$INSTANCE_ROLE_ARN" --arg connector "$VPC_CONNECTOR_ARN" \
-            --arg databaseSecret "$DATABASE_SECRET_ARN" --arg region "$REGION" \
-            --arg bucket "$API_BUCKET" --arg origin "$frontend_url" '
-            .Service as $service |
-            ($service.SourceConfiguration.ImageRepository.ImageConfiguration.RuntimeEnvironmentVariables // {}) as $variables |
-            ($service.SourceConfiguration.ImageRepository.ImageConfiguration.RuntimeEnvironmentSecrets // {}) as $secrets |
+          subnet_json="$(printf '%s' "$SUBNET_IDS" | jq -Rc 'split(",") | map(gsub("^\\s+|\\s+$";""))')"
+          jq -n --arg name "$FUNCTION_NAME" --arg role "$FUNCTION_ROLE_ARN" \
+            --arg image "$ecr_image" --arg bucket "$API_BUCKET" \
+            --arg origin "$frontend_url" --arg database "$DATABASE_URL" \
+            --arg securityGroup "$SECURITY_GROUP_ID" --argjson subnets "$subnet_json" '
             {
-              ServiceArn: $service.ServiceArn,
-              SourceConfiguration: (
-                $service.SourceConfiguration |
-                .AutoDeploymentsEnabled = false |
-                .ImageRepository.ImageIdentifier = $image |
-                .ImageRepository.ImageRepositoryType = "ECR" |
-                .ImageRepository.AuthenticationConfiguration.AccessRoleArn = $ecrRole |
-                .ImageRepository.ImageConfiguration = (
-                  (.ImageRepository.ImageConfiguration // {}) + {
-                    Port: "3000",
-                    RuntimeEnvironmentVariables: ($variables + {
-                      CLOUD_PROVIDER: "aws",
-                      AWS_REGION: $region,
-                      AWS_S3_BUCKET: $bucket,
-                      DB_SSL: "true",
-                      CORS_ORIGIN: $origin
-                    }),
-                    RuntimeEnvironmentSecrets: ($secrets + {
-                      DATABASE_URL: $databaseSecret
-                    })
-                  }
-                )
-              ),
-              InstanceConfiguration: (($service.InstanceConfiguration // {}) | .InstanceRoleArn = $instanceRole),
-              NetworkConfiguration: (
-                ($service.NetworkConfiguration // {}) |
-                .EgressConfiguration = {
-                  EgressType: "VPC",
-                  VpcConnectorArn: $connector
-                }
-              ),
-              HealthCheckConfiguration: {
-                Protocol: "HTTP",
-                Path: "/health",
-                Interval: 10,
-                Timeout: 5,
-                HealthyThreshold: 1,
-                UnhealthyThreshold: 5
+              FunctionName: $name,
+              Role: $role,
+              Code: {ImageUri: $image},
+              PackageType: "Image",
+              Timeout: 30,
+              MemorySize: 512,
+              Architectures: ["x86_64"],
+              Environment: {Variables: {
+                PORT: "3000",
+                AWS_LWA_PORT: "3000",
+                AWS_LWA_READINESS_CHECK_PATH: "/health",
+                CLOUD_PROVIDER: "aws",
+                AWS_S3_BUCKET: $bucket,
+                DB_SSL: "true",
+                CORS_ORIGIN: $origin,
+                DATABASE_URL: $database,
+                MAX_UPLOAD_SIZE_BYTES: "10485760"
+              }},
+              VpcConfig: {
+                SubnetIds: $subnets,
+                SecurityGroupIds: [$securityGroup]
               }
             }
-          ' service.json > update-service.json
-          operation_id="$(aws apprunner update-service \
-            --cli-input-json file://update-service.json --query OperationId --output text)"
-          for attempt in $(seq 1 90); do
-            operation_status="$(aws apprunner list-operations --service-arn "$SERVICE_ARN" \
-              --output json | jq -r --arg id "$operation_id" \
-              '[.OperationSummaryList[] | select(.Id == $id) | .Status][0] // "PENDING"')"
-            if [[ "$operation_status" == "SUCCEEDED" ]]; then break; fi
-            if [[ "$operation_status" == "FAILED" ]]; then
-              echo "::error::A atualizacao do App Runner falhou."
+          ' > create-function.json
+          jq '{Variables: .Environment.Variables}' create-function.json > lambda-environment.json
+          jq '.VpcConfig' create-function.json > lambda-vpc.json
+
+          if aws lambda get-function --function-name "$FUNCTION_NAME" >/dev/null 2>&1; then
+            aws lambda update-function-code --function-name "$FUNCTION_NAME" \
+              --image-uri "$ecr_image" >/dev/null
+            aws lambda wait function-updated-v2 --function-name "$FUNCTION_NAME"
+            aws lambda update-function-configuration --function-name "$FUNCTION_NAME" \
+              --role "$FUNCTION_ROLE_ARN" --timeout 30 --memory-size 512 \
+              --environment file://lambda-environment.json \
+              --vpc-config file://lambda-vpc.json >/dev/null
+            aws lambda wait function-updated-v2 --function-name "$FUNCTION_NAME"
+          else
+            aws lambda create-function --cli-input-json file://create-function.json >/dev/null
+          fi
+          aws lambda wait function-active-v2 --function-name "$FUNCTION_NAME"
+          aws lambda put-function-concurrency --function-name "$FUNCTION_NAME" \
+            --reserved-concurrent-executions 2 >/dev/null
+          log_group="/aws/lambda/$FUNCTION_NAME"
+          log_groups="$(aws logs describe-log-groups \
+            --log-group-name-prefix "$log_group" --output json)"
+          if ! echo "$log_groups" | jq -e --arg name "$log_group" \
+            '.logGroups[]? | select(.logGroupName == $name)' >/dev/null; then
+            aws logs create-log-group --log-group-name "$log_group"
+          fi
+          aws logs put-retention-policy --log-group-name "$log_group" \
+            --retention-in-days 7
+          function_arn="$(aws lambda get-function --function-name "$FUNCTION_NAME" \
+            --query Configuration.FunctionArn --output text)"
+
+          jq -n --arg origin "$frontend_url" '{
+            AllowOrigins: [$origin],
+            AllowMethods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+            AllowHeaders: ["content-type"],
+            MaxAge: 3600
+          }' > api-cors.json
+          api_list="$(aws apigatewayv2 get-apis --output json)"
+          api_id="$(echo "$api_list" | jq -r --arg name "$API_NAME" \
+            '[.Items[] | select(.Name == $name) | .ApiId][0] // empty')"
+          if [[ -z "$api_id" ]]; then
+            api_id="$(aws apigatewayv2 create-api --name "$API_NAME" \
+              --protocol-type HTTP --target "$function_arn" \
+              --cors-configuration file://api-cors.json --query ApiId --output text)"
+          else
+            aws apigatewayv2 update-api --api-id "$api_id" \
+              --cors-configuration file://api-cors.json >/dev/null
+            integrations="$(aws apigatewayv2 get-integrations --api-id "$api_id" --output json)"
+            integration_id="$(echo "$integrations" | jq -r \
+              '[.Items[] | select(.IntegrationType == "AWS_PROXY") | .IntegrationId][0] // empty')"
+            if [[ -z "$integration_id" ]]; then
+              integration_id="$(aws apigatewayv2 create-integration --api-id "$api_id" \
+                --integration-type AWS_PROXY --integration-uri "$function_arn" \
+                --integration-method POST --payload-format-version 2.0 \
+                --query IntegrationId --output text)"
+            else
+              aws apigatewayv2 update-integration --api-id "$api_id" \
+                --integration-id "$integration_id" --integration-uri "$function_arn" \
+                --payload-format-version 2.0 >/dev/null
+            fi
+            routes="$(aws apigatewayv2 get-routes --api-id "$api_id" --output json)"
+            route_id="$(echo "$routes" | jq -r \
+              '[.Items[] | select(.RouteKey == "$default") | .RouteId][0] // empty')"
+            if [[ -z "$route_id" ]]; then
+              aws apigatewayv2 create-route --api-id "$api_id" \
+                --route-key '$default' --target "integrations/$integration_id" >/dev/null
+            else
+              aws apigatewayv2 update-route --api-id "$api_id" --route-id "$route_id" \
+                --target "integrations/$integration_id" >/dev/null
+            fi
+            stages="$(aws apigatewayv2 get-stages --api-id "$api_id" --output json)"
+            if ! echo "$stages" | jq -e '.Items[]? | select(.StageName == "$default")' >/dev/null; then
+              aws apigatewayv2 create-stage --api-id "$api_id" \
+                --stage-name '$default' --auto-deploy >/dev/null
+            fi
+          fi
+          jq -n '{ThrottlingBurstLimit: 5, ThrottlingRateLimit: 2}' > stage-settings.json
+          aws apigatewayv2 update-stage --api-id "$api_id" \
+            --stage-name '$default' --default-route-settings file://stage-settings.json >/dev/null
+
+          statement_id="apigateway-$api_id"
+          if ! aws lambda add-permission --function-name "$FUNCTION_NAME" \
+            --statement-id "$statement_id" --action lambda:InvokeFunction \
+            --principal apigateway.amazonaws.com \
+            --source-arn "arn:aws:execute-api:$REGION:$account_id:$api_id/*/*/*" >/dev/null 2>&1; then
+            policy="$(aws lambda get-policy --function-name "$FUNCTION_NAME" --output text)"
+            if ! echo "$policy" | jq -e --arg sid "$statement_id" \
+              '.Statement[]? | select(.Sid == $sid)' >/dev/null; then
+              echo "::error::Nao foi possivel autorizar o API Gateway a invocar a Lambda."
               exit 1
             fi
-            sleep 10
-          done
-          if [[ "$operation_status" != "SUCCEEDED" ]]; then
-            echo "::error::Tempo esgotado aguardando a atualizacao do App Runner."
-            exit 1
           fi
 
-          api_host="$(aws apprunner describe-service --service-arn "$SERVICE_ARN" \
-            --query 'Service.ServiceUrl' --output text)"
-          echo "api_url=https://$api_host" >> "$GITHUB_OUTPUT"
+          jq -n --arg origin "$frontend_url" '{
+            CORSRules: [{
+              AllowedOrigins: [$origin],
+              AllowedMethods: ["POST"],
+              AllowedHeaders: ["*"],
+              MaxAgeSeconds: 3600
+            }]
+          }' > s3-cors.json
+          aws s3api put-bucket-cors --bucket "$API_BUCKET" \
+            --cors-configuration file://s3-cors.json
+
+          api_url="https://$api_id.execute-api.$REGION.amazonaws.com"
+          echo "api_url=$api_url" >> "$GITHUB_OUTPUT"
           echo "frontend_url=$frontend_url" >> "$GITHUB_OUTPUT"
 
-      - name: Compilar e publicar site no S3 e invalidar o CloudFront
+      - name: Compilar site com upload direto ao S3 e publicar no CloudFront
         if: needs.prepare.outputs.cloud == 'aws'
         env:
           API_URL: ${{ steps.deploy-aws.outputs.api_url }}
@@ -270,7 +349,7 @@ jobs:
         run: |
           set -euo pipefail
           npm ci --prefix frontend
-          VITE_API_URL="$API_URL" npm run build --prefix frontend
+          VITE_API_URL="$API_URL" VITE_DIRECT_SLIDE_UPLOAD=true npm run build --prefix frontend
           aws s3 sync frontend/dist "s3://$BUCKET" --delete
           aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" \
             --paths '/*' >/dev/null
@@ -488,16 +567,16 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           echo "Site e API publicados e verificados."
 
-      - name: Consultar logs do AWS App Runner em caso de falha
+      - name: Consultar logs da AWS Lambda em caso de falha
         if: failure() && needs.prepare.outputs.cloud == 'aws'
         env:
-          LOG_GROUP: ${{ vars.AWS_LOG_GROUP }}
+          FUNCTION_NAME: ${{ vars.AWS_LAMBDA_FUNCTION }}
         run: |
-          if [[ -n "$LOG_GROUP" ]]; then
-            aws logs tail "$LOG_GROUP" --since 10m ||
+          if [[ -n "$FUNCTION_NAME" ]]; then
+            aws logs tail "/aws/lambda/$FUNCTION_NAME" --since 10m ||
               echo "::warning::Falha ao consultar logs do CloudWatch."
           else
-            echo "::warning::Configure AWS_LOG_GROUP para consultar logs no CloudWatch."
+            echo "::warning::Configure AWS_LAMBDA_FUNCTION para consultar logs no CloudWatch."
           fi
 
       - name: Consultar logs do Google Cloud Run em caso de falha

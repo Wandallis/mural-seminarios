@@ -74,6 +74,13 @@ test('cadastra apresentadores, registra a presenca de cada um e apaga seminario 
     assert.equal(healthy, true, `API nao ficou pronta.\n${logs}`);
     await database.query('TRUNCATE attendance, seminars RESTART IDENTITY CASCADE');
 
+    const directUpload = await fetch(`${baseUrl}/api/slides/uploads`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contentType: 'application/pdf', size: 20 })
+    });
+    assert.equal(directUpload.status, 404);
+
     const form = new FormData();
     form.set('title', 'Seminario de teste');
     form.append('presenters', 'Ana Pesquisadora');
