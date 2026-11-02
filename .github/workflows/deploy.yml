@@ -188,6 +188,7 @@ jobs:
               description: "Keep only the five newest deployment images",
               selection: {
                 tagStatus: "tagged",
+                tagPatternList: ["*"],
                 countType: "imageCountMoreThan",
                 countNumber: 5
               },
