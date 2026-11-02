@@ -250,8 +250,6 @@ jobs:
             aws lambda create-function --cli-input-json file://create-function.json >/dev/null
           fi
           aws lambda wait function-active-v2 --function-name "$FUNCTION_NAME"
-          aws lambda put-function-concurrency --function-name "$FUNCTION_NAME" \
-            --reserved-concurrent-executions 2 >/dev/null
           log_group="/aws/lambda/$FUNCTION_NAME"
           log_groups="$(aws logs describe-log-groups \
             --log-group-name-prefix "$log_group" --output json)"
