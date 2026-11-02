@@ -485,6 +485,7 @@ jobs:
             "storage-connection-string=$STORAGE_CONNECTION_STRING" >/dev/null
           az containerapp update --resource-group "$RESOURCE_GROUP" --name "$APP_NAME" \
             --image "$container_image" \
+            --min-replicas 0 --max-replicas 1 \
             --set-env-vars "CLOUD_PROVIDER=azure" "CORS_ORIGIN=$FRONTEND_URL" \
             "AZURE_STORAGE_CONTAINER=$STORAGE_CONTAINER" "DB_SSL=true" \
             "DATABASE_URL=secretref:database-url" \

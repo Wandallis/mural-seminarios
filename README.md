@@ -134,7 +134,9 @@ O segredo `GCP_DATABASE_SECRET` deve conter uma URL PostgreSQL que use o socket 
 | Banco | Azure Database for PostgreSQL |
 | Slides | Azure Blob Storage |
 
-Crie previamente Container Apps com ingress publico na porta 3000, um Azure Container Registry, Static Web Apps, conta/container Blob Storage e PostgreSQL. A identidade de runtime do Container App precisa poder baixar do ACR; a rede/firewall do PostgreSQL deve aceitar conexoes do Container App. O workflow grava a URL do banco e a connection string do Blob como segredos do Container App.
+Crie previamente Container Apps no plano Consumption com ingress publico na porta 3000, minimo de 0 e maximo de 1 replica, um Azure Container Registry, Static Web Apps no plano Free, conta/container Blob Storage e PostgreSQL Flexible Server. A identidade de runtime do Container App precisa poder baixar do ACR; a rede/firewall do PostgreSQL deve aceitar conexoes do Container App. O workflow grava a URL do banco e a connection string do Blob como segredos do Container App e configura a escala entre 0 e 1 replica.
+
+**Custo:** Container Apps Consumption pode escalar a zero; o workflow limita o maximo a uma replica. PostgreSQL Flexible Server cobra compute enquanto esta ativo, alem de armazenamento/backups. Para um teste curto, use uma configuracao pequena sem alta disponibilidade e exclua o grupo de recursos dedicado ao projeto assim que terminar. Creditos promocionais sao temporarios; nao migre para pagamento conforme o uso sem revisar os precos. Alertas de orcamento nao bloqueiam gastos. ACR e Blob Storage tambem podem consumir creditos.
 
 **Variables:** `DEPLOY_TARGET=azure`, `AZURE_RESOURCE_GROUP`, `AZURE_CONTAINER_APP`, `AZURE_ACR_NAME`, `AZURE_STATIC_WEB_APP` e `AZURE_STORAGE_CONTAINER`.
 
