@@ -2,6 +2,8 @@ FROM node:20-alpine
 
 WORKDIR /app
 
+RUN wget -qO /app/global-bundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+
 COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:1.1.0 /lambda-adapter /opt/extensions/lambda-adapter
 
 COPY backend/package*.json ./
