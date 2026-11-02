@@ -317,7 +317,7 @@ jobs:
             --statement-id "$statement_id" --action lambda:InvokeFunction \
             --principal apigateway.amazonaws.com \
             --source-arn "arn:aws:execute-api:$REGION:$account_id:$api_id/*/*/*" >/dev/null 2>&1; then
-            policy="$(aws lambda get-policy --function-name "$FUNCTION_NAME" --output text)"
+            policy="$(aws lambda get-policy --function-name "$FUNCTION_NAME" --query 'Policy' --output text)"
             if ! echo "$policy" | jq -e --arg sid "$statement_id" \
               '.Statement[]? | select(.Sid == $sid)' >/dev/null; then
               echo "::error::Nao foi possivel autorizar o API Gateway a invocar a Lambda."
