@@ -224,6 +224,7 @@ jobs:
                 CLOUD_PROVIDER: "aws",
                 AWS_S3_BUCKET: $bucket,
                 DB_SSL: "true",
+                DB_SSL_CA: "/app/global-bundle.pem",
                 CORS_ORIGIN: $origin,
                 DATABASE_URL: $database,
                 MAX_UPLOAD_SIZE_BYTES: "10485760"
